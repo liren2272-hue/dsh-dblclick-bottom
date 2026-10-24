@@ -1,0 +1,29 @@
+{
+  "name": "@local/dsh-dblclick-bottom",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Double-click the lower area of a conversation panel to scroll the session record to the bottom.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./icon": "./icon.svg",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}

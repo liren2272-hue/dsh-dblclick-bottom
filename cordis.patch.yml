@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-dblclick-bottom
+      name: '@local/dsh-dblclick-bottom'
+      config: {}
