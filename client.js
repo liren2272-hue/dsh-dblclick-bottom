@@ -397,24 +397,6 @@ window.__ModuleLoader__.load({
       try { setTimeout(apply, 300); } catch (e) {}
     }
 
-    // Diagnostic dot, created lazily so it exists before apply() runs and is
-    // reused by the handler inside handleContainer().
-    let dot = null;
-    function getDot() {
-      try {
-        if (dot && document.contains(dot)) return dot;
-        let d = document.querySelector('[data-dblclick-bottom-loaded]');
-        if (!d) {
-          d = document.createElement('div');
-          d.setAttribute('data-dblclick-bottom-loaded', '1');
-          d.style.cssText = 'position:fixed;top:4px;right:4px;width:10px;height:10px;border-radius:50%;background:#e11d48;z-index:999999;pointer-events:none;';
-          (document.body || document.documentElement).appendChild(d);
-        }
-        dot = d;
-        return dot;
-      } catch (e) { return null; }
-    }
-
     function isInteractive(target) {
       try {
         if (!target) return false;
@@ -454,15 +436,6 @@ window.__ModuleLoader__.load({
         const lowerByRegion = isLowerArea(event.target, container);
         const upperByPosition = relative <= TOP_THRESHOLD;
 
-        // Debug: flash the diagnostic dot yellow for the upper-area branch
-        try {
-          const d = getDot();
-          if (d) {
-            d.style.background = upperByPosition ? '#f6e05e' : '#e11d48';
-            setTimeout(() => { try { d.style.background = '#e11d48'; } catch (e) {} }, 200);
-          }
-        } catch (e) {}
-
         // ---- lower area (bottom 28% or composer region) ----
         if (lowerByPosition || lowerByRegion) {
           event.preventDefault();
@@ -486,37 +459,12 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         if (typeof document === 'undefined') return;
 
-        // Diagnostic panel
-        try {
-          const info = `loc=${window.location.href} scrolls=${document.querySelectorAll('[data-conversation-scroll]').length} users=${document.querySelectorAll(USER_TURN_SELECTOR).length}`;
-          const panel = document.querySelector('[data-dblclick-bottom-info]') || document.createElement('div');
-          panel.setAttribute('data-dblclick-bottom-info','1');
-          panel.style.cssText = 'position:fixed;top:4px;left:4px;padding:4px 6px;font:11px monospace;background:#111;color:#0f0;z-index:999999;pointer-events:auto;border-radius:4px;max-width:95vw;word-break:break-all;';
-          panel.textContent = info;
-          // Cache the pristine text so scan() can rebuild it without reading
-          // back its own DOM state (which was the source of the growth loop).
-          panel.__dblclickInfo = info;
-          panel.setAttribute('onclick', "this.style.background='#22c55e'; setTimeout(()=>{this.style.background='#111';},400);");
-          (document.body || document.documentElement).appendChild(panel);
-        } catch (e) {}
-
-        getDot();
-
-        const flash = () => {
-          try {
-            const d = getDot();
-            if (!d) return;
-            d.style.background = '#22c55e';
-            setTimeout(() => { try { d.style.background = '#e11d48'; } catch (e) {} }, 400);
-          } catch (e) {}
-        };
-
         // Attach listeners directly to scroll containers (window/document listeners don't fire).
         const covered = new WeakSet();
         function coverContainer(container) {
           if (!container || covered.has(container)) return;
           covered.add(container);
-          const handler = (event) => { flash(); handleContainer(container, event); };
+          const handler = (event) => { handleContainer(container, event); };
           try { container.addEventListener('dblclick', handler, true); } catch (e) {}
           // manual double-tap via click
           const clickTimes = [];
@@ -528,7 +476,6 @@ window.__ModuleLoader__.load({
               const recent = clickTimes.filter((t) => now - t < 350);
               if (recent.length >= 2) {
                 clickTimes.length = 0;
-                flash();
                 handleContainer(container, event);
               }
             } catch (e) {}
@@ -550,20 +497,6 @@ window.__ModuleLoader__.load({
             const all = [...primary, ...fallbacks.map(s => document.querySelectorAll(s)).flat()].filter(
               (el, idx, arr) => arr.indexOf(el) === idx // dedupe
             );
-            if (all.length > 0) {
-              // Show count on diagnostic panel.
-              // IDEMPOTENT: only write when the text actually differs, so the
-              // write can never re-trigger the subtree MutationObserver below.
-              try {
-                const panel = document.querySelector('[data-dblclick-bottom-info]');
-                if (panel) {
-                  const info = panel.__dblclickInfo || '';
-                  const base = info.slice(info.indexOf('scrolls:') >= 0 ? info.indexOf('scrolls:') + 6 : 0);
-                  const next = `scrolls:${all.length} ${base}`;
-                  if (panel.textContent !== next) panel.textContent = next;
-                }
-              } catch (e) {}
-            }
             all.forEach(coverContainer);
           } catch (e) {}
         }
