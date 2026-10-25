@@ -73,6 +73,21 @@ window.__ModuleLoader__.load({
     // it gives up and jumps within what is already loaded.
     const MAX_AUTO_LOAD = 3;
 
+    // "Jump to the very front": 5+ clicks in the upper region inside a short
+    // window switches the upper-area gesture from walking up message by message
+    // to loading every paged history page and parking at the very top.
+    const RAPID_CLICK_COUNT = 5;
+    const RAPID_CLICK_WINDOW = 2500;
+    // Bounds for the aggressive load-all mode: a chat with a very long paged
+    // history cannot loop forever if the host never removes its control.
+    const MAX_ALL_LOAD = 60;
+    const PAGE_TIMEOUT = 15000;
+
+    // Set while the aggressive "jump to the very front" gesture is loading
+    // history; suppresses the ordinary upper-area double-click walk so the two
+    // cannot fight over the scrollport.
+    let frontJumpInFlight = false;
+
     function scrollToBottom(container) {
       try {
         if (!container) return;
@@ -323,6 +338,80 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * "Jump to the very front": the aggressive mode behind 5+ rapid upper-area
+     * clicks. Where jumpToQuestion walks up one of the user's own messages per
+     * gesture and gives up after MAX_AUTO_LOAD paged pages, this keeps clicking
+     * the host's "load earlier" control until the transcript is exhausted and
+     * then parks the scrollport at the very top — the first message in the
+     * conversation.
+     *
+     * The control is polled the same way loadOlderHistory polls it: a
+     * programmatic click does not fire dblclick, so this cannot recurse into the
+     * double-click handler. Bounded by MAX_ALL_LOAD pages and PAGE_TIMEOUT per
+     * page so a very long paged history cannot loop forever if the host never
+     * removes its control.
+     */
+    function jumpToFront(container) {
+      try {
+        if (!container) return;
+        // The scrollport is [data-conversation-scroll] itself; the walk-up only
+        // guards a fallback container that is not scrollable.
+        let viewport = container;
+        try {
+          let node = container;
+          while (node && node !== document.body) {
+            if (node.scrollHeight > node.clientHeight + 1) { viewport = node; break; }
+            node = node.parentElement;
+          }
+        } catch (e) {}
+        const port = (viewport && viewport.scrollHeight > viewport.clientHeight + 1) ? viewport : container;
+        const scope = conversationScope(container);
+
+        // Park at the very top once history is exhausted. Clears the suppression
+        // flag so the next ordinary upper-area double-click can walk up again.
+        const done = () => {
+          frontJumpInFlight = false;
+          animateScroll(port, 0);
+        };
+
+        const step = (attempt) => {
+          try {
+            if (attempt >= MAX_ALL_LOAD) { done(); return; }
+            const btn = findLoadEarlierButton(scope, port, true);
+            if (!btn) { done(); return; }
+            const label = (btn.textContent || '').trim();
+            btn.click();
+            let settled = false;
+            const finish = () => {
+              if (settled) return;
+              settled = true;
+              try { step(attempt + 1); } catch (e) {}
+            };
+            const started = Date.now();
+            const poll = () => {
+              try {
+                if (Date.now() - started > PAGE_TIMEOUT) { finish(); return; }
+                const now = findLoadEarlierButton(scope, port, false);
+                if (!now) { finish(); return; } // history exhausted
+                const nowLabel = (now.textContent || '').trim();
+                if (nowLabel === label && !now.disabled) { finish(); return; } // page landed
+              } catch (e) {}
+              setTimeout(poll, 100);
+            };
+            // Let React commit the disabled/loading state before the first check.
+            setTimeout(poll, 200);
+          } catch (e) {
+            done();
+          }
+        };
+        frontJumpInFlight = true;
+        step(0);
+      } catch (e) {
+        try { frontJumpInFlight = false; } catch (e2) {}
+      }
+    }
+
+    /**
      * Animate the scrollport to a target offset, then hold it there.
      *
      * The lower-half handler asks the browser to smooth-scroll, so an upward
@@ -419,6 +508,27 @@ window.__ModuleLoader__.load({
       } catch (e) { return false; }
     }
 
+    /**
+     * Whether a click landed in the upper region of the scrollport (top 28%).
+     * Only position matters here: the rapid-click gesture counts raw clicks, so
+     * it cannot reuse handleContainer (which only runs on the second click of a
+     * pair and would never see clicks 1, 3 and 5).
+     */
+    function isUpperArea(target, container, clientY) {
+      try {
+        if (isInteractive(target)) return false;
+        if (isLoadEarlierControl(target, container)) return false;
+        const rect = container.getBoundingClientRect();
+        if (rect.height <= 0) return false;
+        let y = clientY;
+        if (typeof y !== 'number') {
+          try { y = target.getBoundingClientRect().top + 4; }
+          catch (e) { y = rect.top + rect.height; }
+        }
+        return (y - rect.top) / rect.height <= TOP_THRESHOLD;
+      } catch (e) { return false; }
+    }
+
     function handleContainer(container, event) {
       try {
         if (isInteractive(event.target)) return;
@@ -447,6 +557,10 @@ window.__ModuleLoader__.load({
         if (upperByPosition) {
           event.preventDefault();
           event.stopPropagation();
+          // While the rapid "jump to the very front" gesture is still pulling
+          // history, an ordinary double-click must not walk up one message and
+          // fight the aggressive load over the scrollport.
+          if (frontJumpInFlight) return;
           jumpToQuestion(container);
           return;
         }
@@ -468,9 +582,26 @@ window.__ModuleLoader__.load({
           try { container.addEventListener('dblclick', handler, true); } catch (e) {}
           // manual double-tap via click
           const clickTimes = [];
+          // Timestamps of clicks that landed in the upper region, for the rapid
+          // "jump to the very front" gesture (5+ clicks inside the window). Kept
+          // separate from clickTimes so a fast double-tap does not double-count.
+          const upperStamps = [];
           const clickHandler = (event) => {
             try {
               const now = Date.now();
+              // 5+ upper-area clicks inside the window: load all older history and
+              // park at the very top instead of walking up message by message.
+              if (isUpperArea(event.target, container, event.clientY)) {
+                upperStamps.push(now);
+                while (upperStamps.length > RAPID_CLICK_COUNT + 2) upperStamps.shift();
+                while (upperStamps.length > 0 && now - upperStamps[0] > RAPID_CLICK_WINDOW) upperStamps.shift();
+                if (upperStamps.length >= RAPID_CLICK_COUNT) {
+                  upperStamps.length = 0;
+                  clickTimes.length = 0;
+                  jumpToFront(container);
+                  return;
+                }
+              }
               clickTimes.push(now);
               while (clickTimes.length > 5) clickTimes.shift();
               const recent = clickTimes.filter((t) => now - t < 350);

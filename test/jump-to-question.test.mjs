@@ -219,7 +219,18 @@ async function dispatch(file, opts) {
   if (!target && opts.targetIsButton) target = dom.button.element;
   if (!target) target = scroll.children[0] || scroll;
   const before = scroll.scrollTop;
-  handlers[0]({ target, clientY, preventDefault() {}, stopPropagation() {} });
+  const makeEvt = () => ({ target, clientY, preventDefault() {}, stopPropagation() {} });
+  if (opts.clickCount) {
+    // The rapid "jump to the very front" gesture is counted from raw clicks, so
+    // fire the container's click listeners directly (the harness never renders).
+    const clickHandlers = scroll._listeners['click'] || [];
+    if (!clickHandlers.length) throw new Error('no click handler attached to the scrollport');
+    for (let i = 0; i < opts.clickCount; i++) {
+      for (const fn of clickHandlers) fn(makeEvt());
+    }
+  } else {
+    handlers[0](makeEvt());
+  }
   // Let the native-animation fallback, the history-load poll and the retry settle.
   await new Promise((r) => setTimeout(r, opts.waitMs || 700));
   return { before, after: scroll.scrollTop, scrollToCalls: scroll._scrollToCalls || [], clicks: button.clicks };
@@ -343,6 +354,50 @@ const SCENARIOS = [
     },
     expected: 0,
     expectClicks: 3,
+    waitMs: 2500,
+  },
+  // ---- rapid upper-area clicks -> jump to the very front ----
+  {
+    name: 'rapid: 4 upper-area clicks do not trigger the front jump',
+    opts: {
+      scrollTop: 400,
+      rows: [makeRow(0, 0), makeRow(1, 10), makeRow(2, 500)],
+      clickCount: 4,
+    },
+    expected: 286,
+    expectSmooth: true,
+    expectClicks: 0,
+    waitMs: 900,
+  },
+  {
+    name: 'rapid: 5+ upper-area clicks jump to the very front and load every page',
+    opts: (() => {
+      let loads = 0;
+      return {
+        scrollTop: 400,
+        rows: [makeRow(0, 0), makeRow(1, 10), makeRow(2, 500)],
+        clickCount: 5,
+        loadButton: {
+          onLoad: ({ flow, makeRow, button }) => {
+            loads++;
+            if (loads === 1) {
+              // One more page above the viewport; the control stays so the
+              // aggressive gesture has to click it a second time.
+              flow.children.unshift(makeRow(4, 0));
+              flow.children[0].parentElement = flow;
+              button.disabled = false;
+              button.textContent = '加载更早';
+            } else {
+              // History exhausted: the host removes the control.
+              const w = flow.children.find((c) => c.className && c.className.includes('older'));
+              if (w) flow.children.splice(flow.children.indexOf(w), 1);
+            }
+          },
+        },
+      };
+    })(),
+    expected: 0,
+    expectClicks: 2,
     waitMs: 2500,
   },
 ];

@@ -1,9 +1,9 @@
 {
   "name": "@local/dsh-dblclick-bottom",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
-  "description": "Double-click a conversation panel to scroll: the lower half to the bottom, the upper half to the newest of your own messages, auto-loading older history at the boundary.",
+  "description": "Double-click a conversation panel to scroll: the lower half to the bottom, the upper half to the newest of your own messages, auto-loading older history at the boundary, and 5+ rapid upper-area clicks to jump all the way to the very first message.",
   "repository": {
     "type": "git",
     "url": "https://github.com/liren2272-hue/dsh-dblclick-bottom.git"
