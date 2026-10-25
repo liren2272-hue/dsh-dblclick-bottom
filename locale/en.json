@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Double-Click Scroll to Bottom",
-    "description": "Double-click the lower area of a conversation panel to scroll the session record to the bottom."
+    "title": "Double-Click Scroll (Halves)",
+    "description": "Double-click the lower half of a conversation panel to scroll to the bottom; double-click the upper half to jump to your newest message and step upwards, auto-loading older history when needed."
   }
 }

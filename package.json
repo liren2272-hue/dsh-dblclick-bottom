@@ -1,9 +1,17 @@
 {
   "name": "@local/dsh-dblclick-bottom",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "Double-click the lower area of a conversation panel to scroll the session record to the bottom.",
+  "description": "Double-click a conversation panel to scroll: the lower half to the bottom, the upper half to the newest of your own messages, auto-loading older history at the boundary.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/liren2272-hue/dsh-dblclick-bottom.git"
+  },
+  "bugs": {
+    "url": "https://github.com/liren2272-hue/dsh-dblclick-bottom/issues"
+  },
+  "homepage": "https://github.com/liren2272-hue/dsh-dblclick-bottom#readme",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -15,7 +23,8 @@
     "client.js",
     "cordis.patch.yml",
     "icon.svg",
-    "locale/*.json"
+    "locale/*.json",
+    "README.md"
   ],
   "dsh": {
     "bundle": {

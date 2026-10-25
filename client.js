@@ -63,6 +63,16 @@ window.__ModuleLoader__.load({
     const USER_TURN_SELECTOR = '[data-chat-flow-kind="user"],[data-chat-flow-kind="steering"]';
     const TURN_ROW_SELECTOR = '[data-chat-turn]';
 
+    // The host renders its paged-history control above the oldest loaded content
+    // (chat.js ChatView: hasMore && jsx("div", { className: older }, button)).
+    // Its label is localized; match the known strings and fall back to the
+    // CSS-module wrapper class (the local name is "older").
+    const LOAD_EARLIER_TEXT = /^(加载更早|加载更多|加载更早的消息|加载更早内容|加载历史消息|Load earlier|Load more|Load older|Load earlier messages|Load history)$/i;
+    const LOAD_EARLIER_CLASS = /(^|[_-])older([_-]|$)/;
+    // One double-click gesture may pull at most this many history pages before
+    // it gives up and jumps within what is already loaded.
+    const MAX_AUTO_LOAD = 3;
+
     function scrollToBottom(container) {
       try {
         if (!container) return;
@@ -77,8 +87,91 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Find the host's paged-history button inside the flow column.
+     *
+     * It is the only <button type="button"> rendered directly in
+     * [data-chat-flow] above the messages, so matching its label (or its
+     * `*_older` wrapper class) is enough. `enabledOnly` skips the button while a
+     * load is already running, which is how the poll detects completion.
+     */
+    function findLoadEarlierButton(scope, port, enabledOnly) {
+      try {
+        const flow = (port && port.querySelector && port.querySelector('[data-chat-flow]')) || scope;
+        if (!flow || !flow.querySelectorAll) return null;
+        for (const b of flow.querySelectorAll('button')) {
+          if (!b || b.getAttribute('type') !== 'button') continue;
+          if (enabledOnly && b.disabled) continue;
+          const text = (b.textContent || '').trim();
+          if (LOAD_EARLIER_TEXT.test(text)) return b;
+          const wrapper = b.parentElement;
+          const cls = wrapper && wrapper.className;
+          if (typeof cls === 'string' && LOAD_EARLIER_CLASS.test(cls)) return b;
+        }
+      } catch (e) {}
+      return null;
+    }
+
+    /**
+     * Click the host's "load earlier" control and retry once the new page lands.
+     *
+     * When the transcript is paged, the host keeps the scrollport anchored while
+     * the older page loads (loadEarlier -> viewport.beginPaging()). The control
+     * is disabled and relabeled while loading, so polling for it to be restored
+     * (or removed, when history is exhausted) tells us the page has landed and
+     * the newly prepended rows are measurable. A programmatic click does not
+     * fire dblclick, so this cannot recurse into the double-click handler.
+     *
+     * Returns true when a load was started and the caller should return and
+     * retry later; false when there is nothing to load and it should proceed.
+     */
+    function loadOlderHistory(scope, port, attempt, then) {
+      try {
+        if (attempt >= MAX_AUTO_LOAD) return false;
+        const btn = findLoadEarlierButton(scope, port, true);
+        if (!btn) return false;
+        const label = (btn.textContent || '').trim();
+        btn.click();
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          try { then(); } catch (e) {}
+        };
+        const started = Date.now();
+        const poll = () => {
+          try {
+            if (Date.now() - started > 8000) { finish(); return; }
+            const now = findLoadEarlierButton(scope, port, false);
+            if (!now) { finish(); return; } // history exhausted
+            const nowLabel = (now.textContent || '').trim();
+            if (nowLabel === label && !now.disabled) { finish(); return; } // page landed
+          } catch (e) {}
+          setTimeout(poll, 100);
+        };
+        // Let React commit the disabled/loading state before the first check.
+        setTimeout(poll, 200);
+        return true;
+      } catch (e) { return false; }
+    }
+
+    /**
+     * Whether a double-click landed on the host's paged-history control. That
+     * control owns its own click handler, so the plugin must not also jump.
+     */
+    function isLoadEarlierControl(target, container) {
+      try {
+        if (!target || !target.closest) return false;
+        const flow = container.querySelector && container.querySelector('[data-chat-flow]');
+        // enabledOnly=false: a disabled control still owns the click.
+        const btn = findLoadEarlierButton(flow || container, container, false);
+        return !!(btn && target.closest('button') === btn);
+      } catch (e) { return false; }
+    }
+
+    /**
      * Upper-area double click: jump to the user's own message and park it at the
-     * very top of the viewport.
+     * very top of the viewport. The jump animates like the lower half's
+     * scroll-to-bottom instead of snapping.
      *
      * Rules:
      *  - If the viewport is not aligned with any user message, the double-click
@@ -86,15 +179,21 @@ window.__ModuleLoader__.load({
      *  - Repeated double-clicks walk one user message further up the transcript.
      *  - When the first user message is already parked at the top, the next
      *    double-click goes to the very top of the transcript.
+     *  - When the jump reaches the very top of the loaded transcript but the
+     *    host still has older history paged above it, the "load earlier" control
+     *    is clicked automatically and the jump retries once the page lands, so a
+     *    double-click near the top keeps walking up instead of stopping at the
+     *    loaded boundary.
      *  - The host attributes an offset change to the reader (chat.js readScroll
      *    2148-2155), so a direct write does not trip its tail-follow snap-back;
      *    the write only re-asserts while nothing else has moved the port.
      *  - With no user message mounted, the handler does nothing at all — never
      *    falls back to scrolling to the bottom, which reads as a broken feature.
      */
-    function jumpToQuestion(container) {
+    function jumpToQuestion(container, attempt) {
       try {
         if (!container) return;
+        attempt = attempt || 0;
         // The host's scrollport is [data-conversation-scroll] itself
         // (chat.js attach: list.closest("[data-conversation-scroll]") ?? list),
         // and its CSS makes the inner chat column non-scrollable, so the
@@ -109,6 +208,12 @@ window.__ModuleLoader__.load({
           }
         } catch (e) {}
 
+        // The scrollport is the container the handler is attached to; the host
+        // resolves it the same way (chat.js attach: list.closest(
+        // "[data-conversation-scroll]") ?? list). The walk-up above only guards
+        // against a fallback container that is not itself scrollable.
+        const port = (viewport && viewport.scrollHeight > viewport.clientHeight + 1) ? viewport : container;
+
         // Collect the user's own messages, in transcript order. The host
         // resolves a turn anchor the same way: the flow item whose kind is
         // "user" (chat.js turnNavigationItem), mapped onto its turn row.
@@ -117,7 +222,13 @@ window.__ModuleLoader__.load({
         // keeps only this conversation's own rows.
         const root = container.ownerDocument || document;
         const rows = [];
-        const seen = new Set();
+        // Two sets: `seenEl` skips a candidate element that is nested inside
+        // another matching element, while `seenRows` dedupes the resolved turn
+        // row. They must stay separate because the host puts data-chat-flow-kind
+        // ("user") and data-chat-turn on the SAME flow-item element, so row === el
+        // and a single shared set would drop every user message.
+        const seenEl = new Set();
+        const seenRows = new Set();
         // Membership: the row must live inside the same conversation subtree as
         // the container that was double-clicked. Scoping to the closest
         // [data-conversation-content] (the Conversation body that owns this
@@ -126,14 +237,14 @@ window.__ModuleLoader__.load({
         // main transcript when the two are siblings, not nested.
         const scope = conversationScope(container);
         for (const el of root.querySelectorAll(USER_TURN_SELECTOR)) {
-          if (!el || seen.has(el)) continue;
-          seen.add(el);
+          if (!el || seenEl.has(el)) continue;
+          seenEl.add(el);
           if (!scope.contains(el)) continue;
           if (el.closest && el.closest('[hidden]')) continue;
           if (el.closest && el.closest(SIDE_COLUMN_SELECTOR)) continue;
           const row = (el.closest && el.closest(TURN_ROW_SELECTOR)) || el;
-          if (seen.has(row)) continue;
-          seen.add(row);
+          if (seenRows.has(row)) continue;
+          seenRows.add(row);
           if (row.hasAttribute && row.hasAttribute('hidden')) continue;
           if (row.closest && row.closest('[hidden]')) continue;
           const r = row.getBoundingClientRect();
@@ -148,17 +259,17 @@ window.__ModuleLoader__.load({
         });
 
         if (rows.length === 0) {
-          // No user message is mounted in this conversation (empty transcript,
-          // or still loading history). Going to the bottom would look like the
-          // feature is broken, so stay put and let the user retry.
+          // Nothing is mounted yet. If the transcript is paged, the host shows a
+          // "load earlier" control above the flow; pull a page and retry instead
+          // of doing nothing. An empty or still-opening transcript has no control
+          // to click, so stay put.
+          if (loadOlderHistory(scope, port, attempt, () => jumpToQuestion(container, attempt + 1))) return;
+          // No user message is mounted (empty transcript, or still loading
+          // history). Going to the bottom would look like the feature is broken,
+          // so stay put and let the user retry.
           return;
         }
 
-        // The scrollport is the container the handler is attached to; the host
-        // resolves it the same way (chat.js attach: list.closest(
-        // "[data-conversation-scroll]") ?? list). The walk-up above only guards
-        // against a fallback container that is not itself scrollable.
-        const port = (viewport && viewport.scrollHeight > viewport.clientHeight + 1) ? viewport : container;
         const containerRect = port.getBoundingClientRect();
         const items = rows.map((row) => {
           const r = row.getBoundingClientRect();
@@ -195,11 +306,64 @@ window.__ModuleLoader__.load({
           dest = items[idx].offset - PARK_INSET;
         }
 
-        writeScroll(port, dest);
+        // dest === 0 means "as far up as the loaded transcript goes". If the
+        // host still has older history paged above that boundary, load a page
+        // and retry: the double-click should keep walking up past the loaded
+        // edge instead of stopping there.
+        if (dest === 0 && attempt < MAX_AUTO_LOAD &&
+          loadOlderHistory(scope, port, attempt, () => jumpToQuestion(container, attempt + 1))) {
+          return;
+        }
+
+        animateScroll(port, dest);
       } catch (e) {
         // Never fall back to scrolling anywhere on an error: an unexplained jump
         // to the bottom is worse than doing nothing.
       }
+    }
+
+    /**
+     * Animate the scrollport to a target offset, then hold it there.
+     *
+     * The lower-half handler asks the browser to smooth-scroll, so an upward
+     * jump has to do the same or it looks like the feature is broken: the same
+     * native primitive (scrollTo with behavior:'smooth') is used here, with the
+     * instant writeScroll as the fallback for scrollports that cannot animate.
+     *
+     * The hold only starts once the animation settles (scrollend, or a timer for
+     * browsers that lack it), and it is skipped entirely when the port ended up
+     * somewhere the plugin did not send it: a reader gesture or the host's own
+     * follow animation owns the scrollport at that point, and fighting it would
+     * read as a jump tug-of-war.
+     */
+    function animateScroll(port, top) {
+      try {
+        if (!port) return;
+        const max = Math.max(0, port.scrollHeight - port.clientHeight);
+        const target = Math.min(Math.max(0, top), max);
+        const reduced = typeof matchMedia === 'function' &&
+          matchMedia('(prefers-reduced-motion: reduce)').matches;
+        if (!reduced && typeof port.scrollTo === 'function') {
+          const start = port.scrollTop;
+          let released = false;
+          const release = () => {
+            if (released) return;
+            released = true;
+            const current = port.scrollTop;
+            // The smooth request was ignored outright: snap now instead of
+            // leaving the jump undone.
+            if (current === start) { writeScroll(port, target); return; }
+            // The port moved, but not to where we sent it: someone else owns it.
+            if (Math.abs(current - target) > 32) return;
+            writeScroll(port, target);
+          };
+          port.scrollTo({ top: target, behavior: 'smooth' });
+          try { port.addEventListener('scrollend', release, { once: true }); } catch (e) {}
+          try { setTimeout(release, 600); } catch (e) {}
+          return;
+        }
+        writeScroll(port, target);
+      } catch (e) {}
     }
 
     /**
@@ -276,6 +440,8 @@ window.__ModuleLoader__.load({
     function handleContainer(container, event) {
       try {
         if (isInteractive(event.target)) return;
+        // The host's own paged-history control owns its click; let it work.
+        if (isLoadEarlierControl(event.target, container)) return;
         const rect = container.getBoundingClientRect();
         if (rect.height <= 0) return; // safety: nothing to measure
         let clientY = event.clientY;
