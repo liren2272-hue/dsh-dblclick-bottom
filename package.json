@@ -1,9 +1,9 @@
 {
   "name": "@local/dsh-dblclick-bottom",
-  "version": "1.2.0",
+  "version": "1.4.0",
   "private": true,
   "type": "module",
-  "description": "Double-click a conversation panel to scroll: the lower half to the bottom, the upper half to the newest of your own messages, auto-loading older history at the boundary, and 5+ rapid upper-area clicks to jump all the way to the very first message.",
+  "description": "Double-click a conversation panel to scroll: the lower half to the bottom, the upper half to the newest of your own messages, auto-loading older history at the boundary, and 3+ rapid upper-area clicks to jump all the way to the very first message. The upper double and the upper triple are disambiguated by timing: a double-tap walks up one message after a short grace, but a third click landing within that grace supersedes it and jumps straight to the very top as one continuous glide. The aggressive jump also waits for any in-flight older-history load (the 'load earlier' control may already be disabled by a superseded double-click walk-up) instead of bailing, so a double-click immediately followed by a triple-click reaches the very top on the first gesture.",
   "repository": {
     "type": "git",
     "url": "https://github.com/liren2272-hue/dsh-dblclick-bottom.git"

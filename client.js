@@ -73,11 +73,17 @@ window.__ModuleLoader__.load({
     // it gives up and jumps within what is already loaded.
     const MAX_AUTO_LOAD = 3;
 
-    // "Jump to the very front": 5+ clicks in the upper region inside a short
+    // "Jump to the very front": 3+ clicks in the upper region inside a short
     // window switches the upper-area gesture from walking up message by message
     // to loading every paged history page and parking at the very top.
-    const RAPID_CLICK_COUNT = 5;
+    const RAPID_CLICK_COUNT = 3;
     const RAPID_CLICK_WINDOW = 2500;
+    // A double-tap walk-up in the upper area is deferred by this grace so a third
+    // click landing within it is recognized as a triple (jump to the very top)
+    // instead of first animating to the previous message. Kept short so a real
+    // double-click still feels immediate; only rapid triples merge into one
+    // continuous glide to the very top.
+    const DOUBLE_GRACE_MS = 360;
     // Bounds for the aggressive load-all mode: a chat with a very long paged
     // history cannot loop forever if the host never removes its control.
     const MAX_ALL_LOAD = 60;
@@ -87,6 +93,16 @@ window.__ModuleLoader__.load({
     // history; suppresses the ordinary upper-area double-click walk so the two
     // cannot fight over the scrollport.
     let frontJumpInFlight = false;
+    // Set while the aggressive "jump to the very front" gesture is loading
+    // history. An upper-area double-click that started walking up a message just
+    // before the rapid burst fired must abort, otherwise the two fight over the
+    // scrollport and the park-at-top loses. The native dblclick listener still
+    // handles a real upper double-click when no front jump is in flight.
+    let walkAbort = false;
+    // Monotonic id of the current front-park. Each jumpToFront bumps it; any
+    // lingering watchdog/hold from a previous park keeps comparing against this
+    // and stops itself, so an older park cannot fight a newer gesture.
+    let parkId = 0;
 
     function scrollToBottom(container) {
       try {
@@ -208,6 +224,10 @@ window.__ModuleLoader__.load({
     function jumpToQuestion(container, attempt) {
       try {
         if (!container) return;
+        // The aggressive "jump to the very front" gesture started while this
+        // walk-up was still in flight: abandon the walk so the two do not fight
+        // over the scrollport. The result the user wants now is the very top.
+        if (walkAbort) return;
         attempt = attempt || 0;
         // The host's scrollport is [data-conversation-scroll] itself
         // (chat.js attach: list.closest("[data-conversation-scroll]") ?? list),
@@ -338,7 +358,7 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * "Jump to the very front": the aggressive mode behind 5+ rapid upper-area
+     * "Jump to the very front": the aggressive mode behind 3+ rapid upper-area
      * clicks. Where jumpToQuestion walks up one of the user's own messages per
      * gesture and gives up after MAX_AUTO_LOAD paged pages, this keeps clicking
      * the host's "load earlier" control until the transcript is exhausted and
@@ -367,20 +387,68 @@ window.__ModuleLoader__.load({
         const port = (viewport && viewport.scrollHeight > viewport.clientHeight + 1) ? viewport : container;
         const scope = conversationScope(container);
 
-        // Park at the very top once history is exhausted. Clears the suppression
-        // flag so the next ordinary upper-area double-click can walk up again.
+        // Park the scrollport at the very top for the WHOLE gesture. We start the
+        // park the instant the aggressive jump begins — NOT after history is
+        // exhausted — so loading the older pages and the final glide are ONE
+        // continuous upward motion, the same way the lower half's double-click is
+        // one continuous glide to the bottom. Starting early also means the host's
+        // paging-anchor re-park (which would otherwise snap the port to the "load
+        // earlier" row between loads) is re-released on every park tick, so there
+        // is no separate "jump to the load-earlier position" step before the
+        // animation.
+        //
+        // The host keeps a paging anchor while history is loading and re-parks the
+        // scrollport on it during its post-commit layout pass. It ONLY drops that
+        // anchor on a "reading intent" (a pointerdown/wheel/keydown), so parkAtTop
+        // dispatches a synthetic pointerdown to release it, then glides to 0 and
+        // holds. A real user gesture still cancels the park immediately.
+        let parkStarted = false;
         const done = () => {
           frontJumpInFlight = false;
-          animateScroll(port, 0);
+          walkAbort = false;
+          // History exhausted. The continuous park that began with this gesture is
+          // still holding (and still needed, to defend against any late re-park),
+          // so we do NOT start a second one — just clear the suppression flags. If
+          // for some reason the park never started (e.g. no control was found),
+          // start it now so the top is still pinned.
+          if (!parkStarted) parkAtTop(port);
+        };
+
+        const startPark = () => {
+          if (parkStarted) return;
+          parkStarted = true;
+          parkAtTop(port);
         };
 
         const step = (attempt) => {
           try {
             if (attempt >= MAX_ALL_LOAD) { done(); return; }
-            const btn = findLoadEarlierButton(scope, port, true);
-            if (!btn) { done(); return; }
-            const label = (btn.textContent || '').trim();
-            btn.click();
+            // The control only exists while older history is still paged above.
+            const present = findLoadEarlierButton(scope, port, false);
+            if (!present) { done(); return; } // history exhausted: park now
+            // A superseded walk-up (the upper-area double-click that fired just
+            // before this aggressive jump) may already be loading a page, so the
+            // control is present but disabled. Do NOT bail to the park here: that
+            // would leave the scrollport parked at the half-loaded position ("only
+            // reached the previous conversation"). Wait for the in-flight load to
+            // land, then continue from the same attempt (we have not clicked a new
+            // page yet) and load every remaining page to the very top.
+            if (present.disabled) {
+              const started = Date.now();
+              const wait = () => {
+                try {
+                  if (Date.now() - started > PAGE_TIMEOUT) { done(); return; }
+                  const now = findLoadEarlierButton(scope, port, false);
+                  if (!now) { done(); return; } // landed and exhausted meanwhile
+                  if (!now.disabled) { step(attempt); return; } // ready: click it
+                } catch (e) {}
+                setTimeout(wait, 100);
+              };
+              setTimeout(wait, 100);
+              return;
+            }
+            const label = (present.textContent || '').trim();
+            present.click();
             let settled = false;
             const finish = () => {
               if (settled) return;
@@ -405,10 +473,130 @@ window.__ModuleLoader__.load({
           }
         };
         frontJumpInFlight = true;
+        walkAbort = true;
+        startPark();
         step(0);
       } catch (e) {
-        try { frontJumpInFlight = false; } catch (e2) {}
+        try { frontJumpInFlight = false; walkAbort = false; } catch (e2) {}
       }
+    }
+
+    /**
+     * Glide the scrollport to the very top after the aggressive "load earlier"
+     * loop finishes, and hold it there.
+     *
+     * Root cause of the "needs a second gesture to pin to the top" bug: the host
+     * keeps a paging anchor while history is loading and re-parks the scrollport
+     * on that retained row during its post-commit layout pass (beginPaging/
+     * preserve in the host chat bundle). The host ONLY drops that anchor on a
+     * "reading intent" — a pointerdown/wheel/keydown on the scrollport
+     * (READING_INTENTS + onIntent -> stopPreserving in the host bundle). So a
+     * mere scroll write is fought forever; the user's extra real click worked
+     * only because that click released the anchor.
+     *
+     * Fix: release the host anchor deliberately (dispatch a pointerdown on the
+     * scrollport — the same signal a user tap sends), then smooth-glide to 0
+     * with the lower-half's primitive. A short hold loop re-releases and
+     * re-glides while the port is still off the top, so a re-park that lands
+     * within a few hundred ms is absorbed.
+     *
+     * The host, however, can re-park LATE — after images, code blocks or
+     * markdown have committed, often well beyond the first settle, and even
+     * after a brief idle at the top. A short hold loop that stops on
+     * "stable for a few reads" would miss that late re-park and the port would
+     * drift back down, which reads as "only reached the previous spot" and makes
+     * the user wait before they can do anything. So a long-lived watchdog keeps
+     * re-releasing the anchor for up to PARK_MAX_MS; every time the port is off
+     * the top OR the host re-parks (scroll event whose target we did not write),
+     * the watchdog re-arms itself, so a late re-park after a short settle is
+     * still caught. A real trusted user gesture (tap/wheel/key) ends it.
+     *
+     * The hold loop MUST stop on a REAL user gesture. Otherwise, after the park
+     * completed, scrolling down (or a lower-area double-click that scrolls to the
+     * bottom) would be fought by the loop for its whole 5s window, and the user
+     * would have to wait for it to expire. A real pointerdown/wheel/keydown is
+     * trusted (event.isTrusted === true); the synthetic pointerdown we dispatch
+     * to release the host anchor is NOT, so it does not abort the hold.
+     */
+    function releaseHostAnchor(port) {
+      try {
+        // The host listens for these intents on the scrollport (capture phase)
+        // and drops its paging anchor on them. A bare pointerdown carries no
+        // coordinates, so it will not start a text selection or a scroll.
+        const ev = new Event('pointerdown', { bubbles: true, cancelable: true });
+        port.dispatchEvent(ev);
+      } catch (e) {}
+    }
+
+    // How long the park at the very top keeps defending against late host
+    // re-parks. Long enough to outlast image/markdown/code-block layout commits
+    // (which can fire seconds after the scroll has settled), but short enough
+    // that a user who wants to scroll down is only briefly held.
+    const PARK_MAX_MS = 6000;
+
+    function parkAtTop(port) {
+      if (!port) return;
+      const target = 0;
+      const id = ++parkId; // supersede any earlier park still running
+      try {
+        // Drop the host's retained paging anchor first, so it stops fighting us.
+        releaseHostAnchor(port);
+        const max = Math.max(0, port.scrollHeight - port.clientHeight);
+        const top = Math.min(target, max);
+        // Smooth glide to the very top (same primitive the lower-half scroll uses).
+        try { port.scrollTo({ top, behavior: 'smooth' }); }
+        catch (e) { try { port.scrollTop = top; } catch (e2) {} }
+
+        let cancelled = false;
+        const detached = () => (cancelled || id !== parkId);
+        const detach = () => {
+          try { port.removeEventListener('pointerdown', onUserIntent, true); } catch (e) {}
+          try { port.removeEventListener('wheel', onUserIntent, true); } catch (e) {}
+          try { port.removeEventListener('keydown', onUserIntent, true); } catch (e) {}
+          try { port.removeEventListener('scroll', onHostScroll, true); } catch (e) {}
+        };
+        // A REAL, trusted user gesture (tap / wheel / key) ends the park
+        // immediately so a later downward scroll is never fought. The synthetic
+        // pointerdown we dispatch above is untrusted and is ignored here.
+        const onUserIntent = (ev) => {
+          if (ev && ev.isTrusted) { cancelled = true; detach(); }
+        };
+        // A scroll that we did not write (no park wrote it just now) is a host
+        // re-park landing late; re-arm the watchdog so it gets re-released.
+        const onHostScroll = () => {
+          if (detached()) return;
+          if (port.scrollTop > 1) rearm();
+        };
+        try { port.addEventListener('pointerdown', onUserIntent, true); } catch (e) {}
+        try { port.addEventListener('wheel', onUserIntent, true); } catch (e) {}
+        try { port.addEventListener('keydown', onUserIntent, true); } catch (e) {}
+        try { port.addEventListener('scroll', onHostScroll, true); } catch (e) {}
+
+        const deadline = Date.now() + PARK_MAX_MS;
+        // Re-arm the watchdog window whenever we have to act (so a late re-park
+        // after a brief settle still keeps the port defended until PARK_MAX_MS
+        // from the LAST real necessity, not from the first settle).
+        let lastNecessary = Date.now();
+        const rearm = () => { lastNecessary = Date.now(); };
+
+        const hold = () => {
+          if (detached() || Date.now() > deadline) { detach(); return; }
+          try {
+            if (port.scrollTop > 1) {
+              releaseHostAnchor(port);
+              try { port.scrollTo({ top, behavior: 'smooth' }); } catch (e) {}
+              rearm();
+            } else if (Date.now() - lastNecessary > 500) {
+              // Quiet at the top for ~500ms and nothing re-parked us: the host has
+              // let go. Stop so a later downward scroll is never fought.
+              detach();
+              return;
+            }
+          } catch (e) {}
+          setTimeout(hold, 90);
+        };
+        setTimeout(hold, 90);
+      } catch (e) {}
     }
 
     /**
@@ -531,6 +719,9 @@ window.__ModuleLoader__.load({
 
     function handleContainer(container, event) {
       try {
+        // While the aggressive "jump to the very front" gesture is still pulling
+        // history and holding the park, no ordinary double-click should fight it.
+        if (frontJumpInFlight) return;
         if (isInteractive(event.target)) return;
         // The host's own paged-history control owns its click; let it work.
         if (isLoadEarlierControl(event.target, container)) return;
@@ -544,7 +735,6 @@ window.__ModuleLoader__.load({
         const relative = (clientY - rect.top) / rect.height; // 0.0=top, 1.0=bottom
         const lowerByPosition = relative >= BOTTOM_THRESHOLD;
         const lowerByRegion = isLowerArea(event.target, container);
-        const upperByPosition = relative <= TOP_THRESHOLD;
 
         // ---- lower area (bottom 28% or composer region) ----
         if (lowerByPosition || lowerByRegion) {
@@ -554,16 +744,11 @@ window.__ModuleLoader__.load({
           return;
         }
         // ---- upper area (top 28%) ----
-        if (upperByPosition) {
-          event.preventDefault();
-          event.stopPropagation();
-          // While the rapid "jump to the very front" gesture is still pulling
-          // history, an ordinary double-click must not walk up one message and
-          // fight the aggressive load over the scrollport.
-          if (frontJumpInFlight) return;
-          jumpToQuestion(container);
-          return;
-        }
+        // The upper gesture is driven entirely by the click counter in
+        // coverContainer, which defers the walk-up by a short grace so a rapid
+        // triple-click merges into one continuous glide to the very top instead
+        // of first jumping to the previous message. The native dblclick therefore
+        // does nothing here; the counter decides.
         // ---- middle/other: do nothing (keep native selection etc) ----
       } catch (e) {}
     }
@@ -580,28 +765,61 @@ window.__ModuleLoader__.load({
           covered.add(container);
           const handler = (event) => { handleContainer(container, event); };
           try { container.addEventListener('dblclick', handler, true); } catch (e) {}
-          // manual double-tap via click
+          // The upper-area gesture is driven entirely by raw upper clicks so the
+          // double and the triple are disambiguated by timing instead of by
+          // racing the native dblclick:
+          //   - 2 upper clicks within DOUBLE_GRACE_MS => walk up ONE message
+          //     (jumpToQuestion). It is deferred until the grace elapses, so a
+          //     3rd click arriving in time SUPERSEDES it and jumps to the very
+          //     top instead — i.e. a rapid triple is one continuous glide, not a
+          //     walk-up followed by a jump.
+          //   - 3 upper clicks within RAPID_CLICK_WINDOW => jump to the very top
+          //     (jumpToFront) immediately, cancelling any pending walk-up.
+          // The lower area still relies on the native dblclick (handleContainer),
+          // with a manual double-tap fallback below for touch where dblclick is
+          // unreliable.
+          const upperStamps = []; // timestamps of upper-area clicks
+          let upperTimer = null;  // grace timer for the deferred walk-up
+          let upperWalkArmed = false; // a 2-click walk-up is pending
+          // Manual double-tap fallback for the lower area (touch, no dblclick).
           const clickTimes = [];
-          // Timestamps of clicks that landed in the upper region, for the rapid
-          // "jump to the very front" gesture (5+ clicks inside the window). Kept
-          // separate from clickTimes so a fast double-tap does not double-count.
-          const upperStamps = [];
           const clickHandler = (event) => {
             try {
               const now = Date.now();
-              // 5+ upper-area clicks inside the window: load all older history and
-              // park at the very top instead of walking up message by message.
               if (isUpperArea(event.target, container, event.clientY)) {
+                // While the aggressive front jump is still pulling history, drop
+                // further upper clicks so the park is not disturbed.
+                if (frontJumpInFlight) return;
                 upperStamps.push(now);
                 while (upperStamps.length > RAPID_CLICK_COUNT + 2) upperStamps.shift();
                 while (upperStamps.length > 0 && now - upperStamps[0] > RAPID_CLICK_WINDOW) upperStamps.shift();
+                // Triple within the window: jump to the very top NOW, and
+                // supersede any pending deferred walk-up.
                 if (upperStamps.length >= RAPID_CLICK_COUNT) {
                   upperStamps.length = 0;
-                  clickTimes.length = 0;
+                  if (upperTimer) { clearTimeout(upperTimer); upperTimer = null; }
+                  upperWalkArmed = false;
                   jumpToFront(container);
                   return;
                 }
+                // Two close upper clicks (a genuine double-tap) without a third
+                // yet: arm the deferred walk-up. A 3rd click in time cancels it
+                // (handled above). The gap must be within the grace, so two slow
+                // separate clicks do not animate a walk-up.
+                const n = upperStamps.length;
+                if (n >= 2 && !upperWalkArmed && (now - upperStamps[n - 2]) <= DOUBLE_GRACE_MS) {
+                  upperWalkArmed = true;
+                  upperTimer = setTimeout(() => {
+                    upperWalkArmed = false;
+                    upperTimer = null;
+                    upperStamps.length = 0;
+                    if (!frontJumpInFlight) jumpToQuestion(container);
+                  }, DOUBLE_GRACE_MS);
+                }
+                return;
               }
+              // Lower / middle: manual double-tap detection (native dblclick may
+              // be absent on touch). handleContainer routes it to scrollToBottom.
               clickTimes.push(now);
               while (clickTimes.length > 5) clickTimes.shift();
               const recent = clickTimes.filter((t) => now - t < 350);
