@@ -192,10 +192,18 @@ window.__ModuleLoader__.load({
     function isLoadEarlierControl(target, container) {
       try {
         if (!target || !target.closest) return false;
-        const flow = container.querySelector && container.querySelector('[data-chat-flow]');
-        // enabledOnly=false: a disabled control still owns the click.
-        const btn = findLoadEarlierButton(flow || container, container, false);
-        return !!(btn && target.closest('button') === btn);
+        // PERF: the clicked element decides on its own. The previous version
+        // scanned EVERY <button> in the whole transcript (the host does not
+        // virtualize the flow, so a long conversation holds thousands of them)
+        // on every single click, in the capture phase. Same predicate, applied
+        // to the button the click actually landed on, so the cost is O(depth)
+        // instead of O(DOM). A disabled control still owns its click.
+        const btn = target.closest('button');
+        if (!btn || btn.getAttribute('type') !== 'button') return false;
+        if (LOAD_EARLIER_TEXT.test((btn.textContent || '').trim())) return true;
+        const wrapper = btn.parentElement;
+        const cls = wrapper && wrapper.className;
+        return typeof cls === 'string' && LOAD_EARLIER_CLASS.test(cls);
       } catch (e) { return false; }
     }
 
@@ -252,10 +260,23 @@ window.__ModuleLoader__.load({
         // Collect the user's own messages, in transcript order. The host
         // resolves a turn anchor the same way: the flow item whose kind is
         // "user" (chat.js turnNavigationItem), mapped onto its turn row.
-        // Searching the document keeps the walk-up above from narrowing the
-        // search to a subtree that holds no user message; the scope test then
-        // keeps only this conversation's own rows.
-        const root = container.ownerDocument || document;
+        //
+        // PERF: search the CONVERSATION SCOPE, not the document. Every
+        // candidate had to pass `scope.contains(el)` anyway, so anything
+        // outside the scope was scanned and thrown away; with an unvirtualized
+        // transcript that is tens of thousands of elements walked on every
+        // double-click, and it also picked up side-column copies only to
+        // reject them one by one. Keep the same membership rules, just start
+        // from the subtree we actually keep.
+        const scope = conversationScope(container);
+        const candidates = [];
+        try {
+          if (scope.matches && scope.matches(USER_TURN_SELECTOR)) candidates.push(scope);
+        } catch (e) {}
+        try {
+          for (const el of scope.querySelectorAll(USER_TURN_SELECTOR)) candidates.push(el);
+        } catch (e) {}
+
         const rows = [];
         // Two sets: `seenEl` skips a candidate element that is nested inside
         // another matching element, while `seenRows` dedupes the resolved turn
@@ -264,14 +285,13 @@ window.__ModuleLoader__.load({
         // and a single shared set would drop every user message.
         const seenEl = new Set();
         const seenRows = new Set();
-        // Membership: the row must live inside the same conversation subtree as
-        // the container that was double-clicked. Scoping to the closest
-        // [data-conversation-content] (the Conversation body that owns this
-        // scrollport, conversation.js:17862-17877) rather than a bare
-        // contains() keeps side-column copies out while still accepting the
-        // main transcript when the two are siblings, not nested.
-        const scope = conversationScope(container);
-        for (const el of root.querySelectorAll(USER_TURN_SELECTOR)) {
+        // PERF: one getBoundingClientRect per row, reused for the sort and the
+        // offset map below. All reads happen before any write, so they are the
+        // same values the two extra passes used to re-measure — but the old
+        // comparator called gBCR inside the sort (O(n log n) forced layout reads
+        // on a giant unvirtualized tree).
+        const rects = new Map();
+        for (const el of candidates) {
           if (!el || seenEl.has(el)) continue;
           seenEl.add(el);
           if (!scope.contains(el)) continue;
@@ -284,13 +304,15 @@ window.__ModuleLoader__.load({
           if (row.closest && row.closest('[hidden]')) continue;
           const r = row.getBoundingClientRect();
           if (r.height === 0) continue;
+          rects.set(row, r);
           rows.push(row);
         }
         rows.sort((a, b) => {
           const ta = parseInt(a.getAttribute('data-chat-turn') || '0', 10);
           const tb = parseInt(b.getAttribute('data-chat-turn') || '0', 10);
           if (ta !== tb) return ta - tb;
-          return a.getBoundingClientRect().top - b.getBoundingClientRect().top;
+          const ra = rects.get(a); const rb = rects.get(b);
+          return (ra ? ra.top : 0) - (rb ? rb.top : 0);
         });
 
         if (rows.length === 0) {
@@ -307,7 +329,7 @@ window.__ModuleLoader__.load({
 
         const containerRect = port.getBoundingClientRect();
         const items = rows.map((row) => {
-          const r = row.getBoundingClientRect();
+          const r = rects.get(row) || row.getBoundingClientRect();
           return { row, offset: (r.top - containerRect.top) + port.scrollTop };
         }).sort((a, b) => a.offset - b.offset);
 
@@ -832,33 +854,96 @@ window.__ModuleLoader__.load({
           try { container.addEventListener('click', clickHandler, true); } catch (e) {}
         }
 
+        // Fallback selectors commonly used in this Harness UI, folded into ONE
+        // selector string: a single document pass instead of five, and the same
+        // union is what the mutation filter tests against.
+        const FALLBACK_SELECTORS = [
+          '.conversation-viewport',
+          '.chat-view',
+          '[data-chat-view]',
+          '.conversation-scroll',
+        ];
+        const PORT_QUERY = [CONVERSATION_SELECTOR].concat(FALLBACK_SELECTORS).join(',');
+
         function scan() {
           try {
-            // Primary selector: data-conversation-scroll
-            const primary = document.querySelectorAll(CONVERSATION_SELECTOR);
-            // Fallback selectors commonly used in this Harness UI
-            const fallbacks = [
-              '.conversation-viewport',
-              '.chat-view',
-              '[data-chat-view]',
-              '.conversation-scroll',
-            ];
-            const all = [...primary, ...fallbacks.map(s => document.querySelectorAll(s)).flat()].filter(
-              (el, idx, arr) => arr.indexOf(el) === idx // dedupe
-            );
-            all.forEach(coverContainer);
+            document.querySelectorAll(PORT_QUERY).forEach(coverContainer);
           } catch (e) {}
         }
-        // Re-entry guard: a scan triggered by our own mutations must not run
-        // concurrently (and must not schedule another). One pass at a time.
-        let scanning = false;
-        function guardedScan() {
-          if (scanning) return;
-          scanning = true;
-          try { scan(); } finally { scanning = false; }
+
+        // Discovery of NEW scroll containers is what the observer is for. It must
+        // never turn into a transcript-wide scan: the host renders a long
+        // conversation as thousands of live elements (the flow list is not
+        // virtualized) and streaming appends to them every frame. With
+        // {childList,subtree} on documentElement, that used to re-enter this
+        // callback many times per frame and each entry walked the whole document
+        // five times over — the interface then locks up for seconds at a time.
+        //
+        // So each mutation batch is cheaply classified first:
+        //  - an added element that IS a container -> cover it directly;
+        //  - a change nested inside a known container -> reader content, ignore;
+        //  - anything outside every container (app shell / conversation remount),
+        //    or removals that detached themselves from the tree -> schedule a scan.
+        // Batches that do need a scan are coalesced into one pass per animation
+        // frame, and the 5s safety net below still catches anything the
+        // classification deliberately lets slide.
+        function needsScan(rec) {
+          const added = rec.addedNodes;
+          for (let i = 0; i < added.length; i++) {
+            const n = added[i];
+            if (!n || n.nodeType !== 1 || !n.closest) continue;
+            const port = n.closest(PORT_QUERY);
+            if (port === n) return 'cover'; // a brand-new scroll container
+            if (!port) return true;         // shell-level mount: discover ports
+          }
+          const removed = rec.removedNodes;
+          for (let i = 0; i < removed.length; i++) {
+            const n = removed[i];
+            if (!n || n.nodeType !== 1 || !n.closest) continue;
+            if (!n.closest(PORT_QUERY)) return true; // container/subtree torn out
+          }
+          const target = rec.target;
+          if (target && target.nodeType === 1 && target.closest) {
+            if (!target.closest(PORT_QUERY)) return true;
+          }
+          return false;
         }
-        guardedScan();
-        const obs = new MutationObserver(guardedScan);
+
+        let pending = false;   // a full scan is queued for the next frame
+        let scanning = false;  // one pass at a time (never re-entrant)
+        function guardedScan() {
+          if (scanning || pending) return;
+          pending = true;
+          const run = () => {
+            pending = false;
+            if (scanning) return;
+            scanning = true;
+            try { scan(); } finally { scanning = false; }
+          };
+          try { requestAnimationFrame(run); } catch (e) { run(); }
+        }
+        function onMutations(records) {
+          try {
+            let structural = false;
+            for (const rec of records) {
+              const verdict = needsScan(rec);
+              if (verdict === 'cover') {
+                // Cover it now: waiting a frame for a container we can already see
+                // would leave the gesture dead for that frame.
+                const n = Array.prototype.find.call(rec.addedNodes, (x) => x && x.nodeType === 1 && x.closest && x.closest(PORT_QUERY) === x);
+                if (n) coverContainer(n);
+              } else if (verdict === true) {
+                structural = true;
+              }
+            }
+            if (structural) guardedScan();
+          } catch (e) {}
+        }
+        // First pass synchronous so a container that already exists is covered
+        // before the user can interact with it; only later, mutation-driven
+        // passes are coalesced into a frame.
+        scan();
+        const obs = new MutationObserver(onMutations);
         try { obs.observe(document.documentElement, { childList: true, subtree: true }); } catch (e) {}
         // Part B: the 1s poll is redundant now that the panel write is
         // idempotent. Keep a slow, cheap safety net instead of a hot loop:
