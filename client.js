@@ -104,11 +104,39 @@ window.__ModuleLoader__.load({
     // and stops itself, so an older park cannot fight a newer gesture.
     let parkId = 0;
 
+    // Beyond this many viewport heights a gesture stops animating and writes the
+    // offset directly. A native smooth glide emits roughly one scroll event per
+    // animation frame for a second and a half, and on the host every one of those
+    // is answered with layout work: onScroll -> readScroll/invalidate, then at
+    // scrollend acknowledge -> reclaimBelow (a spacer height write) ->
+    // refreshActiveTurn -> readVisibleTurn's O(all rows) probe over a transcript
+    // that is NOT virtualized (the chat bundle's only useVirtualizer is the turn
+    // rail; every loaded message stays mounted). Measured on a b04b03-shaped DOM
+    // of 270k elements, one smooth "scroll to bottom" fired 67 scroll events and
+    // 2 scrollends where the same destination reached by an instant write fired 1
+    // and 0. Chromium already refuses to animate very long distances, so the
+    // glide is a cost with no payoff past a few screens.
+    const SMOOTH_MAX_VP = 6;
+
+    // Request a smooth glide when the distance is short enough to stay cheap,
+    // otherwise write the offset directly. Returns true only when a smooth
+    // request was actually issued, so callers keep their scrollend bookkeeping
+    // tied to a real animation. No clamping here: the browser clamps both forms.
+    function glideOrSnap(port, top) {
+      const viewport = port.clientHeight || 0;
+      if (viewport && Math.abs(top - port.scrollTop) > SMOOTH_MAX_VP * viewport) {
+        port.scrollTop = top;
+        return false;
+      }
+      port.scrollTo({ top, behavior: 'smooth' });
+      return true;
+    }
+
     function scrollToBottom(container) {
       try {
         if (!container) return;
         if (typeof container.scrollTo === 'function') {
-          container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+          glideOrSnap(container, container.scrollHeight);
         } else {
           container.scrollTop = container.scrollHeight;
         }
@@ -129,6 +157,27 @@ window.__ModuleLoader__.load({
       try {
         const flow = (port && port.querySelector && port.querySelector('[data-chat-flow]')) || scope;
         if (!flow || !flow.querySelectorAll) return null;
+        // PERF: the host renders this control as ONE direct child wrapper of the
+        // flow column, above the messages (host chat bundle: `hasMore &&
+        // <div className={css.older}><button type="button" .../></div>`). So the
+        // small prefix of flow children is checked first. The full
+        // querySelectorAll('button') below then only runs as a last resort for
+        // builds that place the control elsewhere — important because this
+        // function is polled every 100ms while a page loads, and the host does
+        // not virtualize the flow, so a long transcript holds thousands of
+        // buttons to walk on each poll.
+        const children = flow.children || [];
+        const limit = Math.min(children.length, 6);
+        for (let i = 0; i < limit; i++) {
+          const wrapper = children[i];
+          if (!wrapper || !wrapper.querySelector) continue;
+          const cls = wrapper.className;
+          if (typeof cls !== 'string' || !LOAD_EARLIER_CLASS.test(cls)) continue;
+          const b = wrapper.querySelector('button');
+          if (!b || b.getAttribute('type') !== 'button') continue;
+          if (enabledOnly && b.disabled) continue;
+          return b;
+        }
         for (const b of flow.querySelectorAll('button')) {
           if (!b || b.getAttribute('type') !== 'button') continue;
           if (enabledOnly && b.disabled) continue;
@@ -542,10 +591,18 @@ window.__ModuleLoader__.load({
      */
     function releaseHostAnchor(port) {
       try {
-        // The host listens for these intents on the scrollport (capture phase)
-        // and drops its paging anchor on them. A bare pointerdown carries no
-        // coordinates, so it will not start a text selection or a scroll.
-        const ev = new Event('pointerdown', { bubbles: true, cancelable: true });
+        // The host listens for these intents ON the scrollport, in capture phase
+        // (host chat bundle: `for (const type of READING_INTENTS)
+        // scroller.addEventListener(type, this.onIntent, {capture:true})`), and a
+        // listener registered on the event's target fires in the target phase
+        // whether or not the event bubbles — so the anchor release is unaffected
+        // by NOT bubbling. Bubbling was actively harmful: this is dispatched
+        // repeatedly by the hold loop below, and every trip up the tree walks the
+        // whole React ancestor chain and also reaches a SECOND reading-intent
+        // layer inside the chat view (`follow.interrupt(...)` on pointerdown over
+        // the flow body) whose layout reads we have no reason to provoke. A bare
+        // pointerdown carries no coordinates, so it starts no selection or scroll.
+        const ev = new Event('pointerdown', { bubbles: false, cancelable: true });
         port.dispatchEvent(ev);
       } catch (e) {}
     }
@@ -556,6 +613,17 @@ window.__ModuleLoader__.load({
     // that a user who wants to scroll down is only briefly held.
     const PARK_MAX_MS = 6000;
 
+    // Wake-up cadence of the hold loop. It used to be 90ms — up to ~66 ticks per
+    // park, each one dispatching a pointerdown and starting a fresh smooth glide
+    // over a scrollport whose content is tens of thousands of live elements. Every
+    // one of those writes drives the host's own scroll machinery (onScroll ->
+    // readScroll/invalidate, scrollend -> acknowledge -> reclaimBelow spacer write
+    // -> refreshActiveTurn's O(DOM) row probe), so the loop was multiplying host
+    // work, not plugin work. 300ms is still well inside the window where a late
+    // host re-park is visible as "it slid back down", and cuts that multiplier by
+    // more than 3x (<= ~20 ticks per park).
+    const HOLD_TICK_MS = 300;
+
     function parkAtTop(port) {
       if (!port) return;
       const target = 0;
@@ -565,8 +633,11 @@ window.__ModuleLoader__.load({
         releaseHostAnchor(port);
         const max = Math.max(0, port.scrollHeight - port.clientHeight);
         const top = Math.min(target, max);
-        // Smooth glide to the very top (same primitive the lower-half scroll uses).
-        try { port.scrollTo({ top, behavior: 'smooth' }); }
+        // Same primitive the lower-half scroll uses: a glide when the distance is
+        // short, a direct write when it is long. Parking from the bottom of a long
+        // transcript is exactly the long case, and gliding there would fire ~100
+        // scroll events, each answered by host layout work.
+        try { glideOrSnap(port, top); }
         catch (e) { try { port.scrollTop = top; } catch (e2) {} }
 
         let cancelled = false;
@@ -606,7 +677,7 @@ window.__ModuleLoader__.load({
           try {
             if (port.scrollTop > 1) {
               releaseHostAnchor(port);
-              try { port.scrollTo({ top, behavior: 'smooth' }); } catch (e) {}
+              try { glideOrSnap(port, top); } catch (e) {}
               rearm();
             } else if (Date.now() - lastNecessary > 500) {
               // Quiet at the top for ~500ms and nothing re-parked us: the host has
@@ -615,9 +686,9 @@ window.__ModuleLoader__.load({
               return;
             }
           } catch (e) {}
-          setTimeout(hold, 90);
+          setTimeout(hold, HOLD_TICK_MS);
         };
-        setTimeout(hold, 90);
+        setTimeout(hold, HOLD_TICK_MS);
       } catch (e) {}
     }
 
@@ -656,7 +727,11 @@ window.__ModuleLoader__.load({
             if (Math.abs(current - target) > 32) return;
             writeScroll(port, target);
           };
-          port.scrollTo({ top: target, behavior: 'smooth' });
+          // Walking to an earlier question in a long transcript is usually many
+          // screens away. glideOrSnap writes those offsets directly, and in that
+          // case there is no animation to wait for: the scrollend/timer bookkeeping
+          // would only add host-visible scroll events for a jump already done.
+          if (!glideOrSnap(port, target)) { writeScroll(port, target); return; }
           try { port.addEventListener('scrollend', release, { once: true }); } catch (e) {}
           try { setTimeout(release, 600); } catch (e) {}
           return;
@@ -854,21 +929,39 @@ window.__ModuleLoader__.load({
           try { container.addEventListener('click', clickHandler, true); } catch (e) {}
         }
 
-        // Fallback selectors commonly used in this Harness UI, folded into ONE
-        // selector string: a single document pass instead of five, and the same
-        // union is what the mutation filter tests against.
+        // Legacy selectors from older/alternative Harness builds. These exist
+        // ONLY as a fallback: measured on a 150K-element transcript, one
+        // document.querySelectorAll of the comma-joined union costs ~7.8ms while
+        // the primary selector alone costs ~0.0ms — a multi-selector list loses
+        // Blink's fast "nothing can match this" path and walks the whole tree for
+        // each branch. And the current host renders none of these classes at all
+        // (verified: they appear only inside CSS strings in the host bundle).
+        // So the primary pass runs alone and the fallbacks only when it is empty.
         const FALLBACK_SELECTORS = [
           '.conversation-viewport',
           '.chat-view',
           '[data-chat-view]',
           '.conversation-scroll',
         ];
-        const PORT_QUERY = [CONVERSATION_SELECTOR].concat(FALLBACK_SELECTORS).join(',');
 
         function scan() {
           try {
-            document.querySelectorAll(PORT_QUERY).forEach(coverContainer);
+            const ports = document.querySelectorAll(CONVERSATION_SELECTOR);
+            if (ports.length) { ports.forEach(coverContainer); return; }
+            for (const sel of FALLBACK_SELECTORS) {
+              document.querySelectorAll(sel).forEach(coverContainer);
+            }
           } catch (e) {}
+        }
+
+        // Classification helper: the primary port only. A build that uses a
+        // legacy class makes this return null for its mutations, which reads as
+        // "shell-level change" and schedules a full scan — the scan then finds
+        // nothing under the primary selector and runs the fallbacks, so such a
+        // build is still covered, one frame later.
+        function portOf(node) {
+          try { return node && node.closest ? node.closest(CONVERSATION_SELECTOR) : null; }
+          catch (e) { return null; }
         }
 
         // Discovery of NEW scroll containers is what the observer is for. It must
@@ -892,7 +985,7 @@ window.__ModuleLoader__.load({
           for (let i = 0; i < added.length; i++) {
             const n = added[i];
             if (!n || n.nodeType !== 1 || !n.closest) continue;
-            const port = n.closest(PORT_QUERY);
+            const port = portOf(n);
             if (port === n) return 'cover'; // a brand-new scroll container
             if (!port) return true;         // shell-level mount: discover ports
           }
@@ -900,11 +993,11 @@ window.__ModuleLoader__.load({
           for (let i = 0; i < removed.length; i++) {
             const n = removed[i];
             if (!n || n.nodeType !== 1 || !n.closest) continue;
-            if (!n.closest(PORT_QUERY)) return true; // container/subtree torn out
+            if (!portOf(n)) return true; // container/subtree torn out
           }
           const target = rec.target;
           if (target && target.nodeType === 1 && target.closest) {
-            if (!target.closest(PORT_QUERY)) return true;
+            if (!portOf(target)) return true;
           }
           return false;
         }
@@ -930,7 +1023,7 @@ window.__ModuleLoader__.load({
               if (verdict === 'cover') {
                 // Cover it now: waiting a frame for a container we can already see
                 // would leave the gesture dead for that frame.
-                const n = Array.prototype.find.call(rec.addedNodes, (x) => x && x.nodeType === 1 && x.closest && x.closest(PORT_QUERY) === x);
+                const n = Array.prototype.find.call(rec.addedNodes, (x) => x && x.nodeType === 1 && portOf(x) === x);
                 if (n) coverContainer(n);
               } else if (verdict === true) {
                 structural = true;

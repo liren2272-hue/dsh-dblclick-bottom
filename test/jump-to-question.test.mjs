@@ -141,7 +141,7 @@ function makeRow(turn, top, kind = 'user') {
 function buildDom(opts) {
   const {
     scrollTop = 400, rows = [], clientY = 50, contentRectTop = 100,
-    scrollTo = true, loadButton = null,
+    scrollTo = true, loadButton = null, scrollHeight = 1000,
   } = opts;
 
   const document = makeEl('#document');
@@ -161,7 +161,7 @@ function buildDom(opts) {
 
   const scroll = makeEl('div');
   scroll.setAttribute('data-conversation-scroll', '');
-  scroll.scrollHeight = 1000;
+  scroll.scrollHeight = scrollHeight;
   scroll.clientHeight = 600;
   scroll.scrollTop = scrollTop;
   scroll._rect = { top: contentRectTop, left: 0, width: 800, height: 600, bottom: contentRectTop + 600, right: 800 };
@@ -314,6 +314,38 @@ const SCENARIOS = [
     opts: { scrollTop: 400, rows: [makeRow(0, 0), makeRow(1, 10), makeRow(2, 500)], scrollTo: false, clickCount: 2 },
     expected: 286,
     expectSmooth: false,
+    waitMs: 900,
+  },
+  // ---- long-distance writes: glide only over short spans (v1.4.3) ----
+  // A smooth scroll over many screens fires ~100 scroll events, and each one
+  // drives the host's own scroll machinery over a transcript that is not
+  // virtualized. Past a few viewports the plugin must write the offset directly.
+  {
+    name: 'snap: lower double-click over a long transcript writes the bottom directly',
+    opts: { scrollTop: 0, scrollHeight: 200000, clientY: 700, rows: [makeRow(0, 100)] },
+    expected: 200000,
+    expectSmooth: false,
+  },
+  {
+    name: 'snap: upper double-click across a huge turn writes the offset directly',
+    opts: {
+      // Row 1 is parked at the viewport top (offset == scrollTop); row 0 is the
+      // previous user message, 20000px above it, which in the real DOM means a
+      // negative viewport-relative rect top.
+      scrollTop: 150000,
+      scrollHeight: 200000,
+      rows: [makeRow(0, -19900), makeRow(1, 100)],
+      clickCount: 2,
+    },
+    expected: 129976,
+    expectSmooth: false,
+    waitMs: 900,
+  },
+  {
+    name: 'snap: a short upper jump still glides',
+    opts: { scrollTop: 150000, scrollHeight: 200000, rows: [makeRow(0, -1200), makeRow(1, 100)], clickCount: 2 },
+    expected: 148676,
+    expectSmooth: true,
     waitMs: 900,
   },
   // ---- paged history ----
