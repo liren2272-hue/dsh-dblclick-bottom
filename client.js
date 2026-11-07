@@ -449,6 +449,110 @@ window.__ModuleLoader__.load({
      * page so a very long paged history cannot loop forever if the host never
      * removes its control.
      */
+    /**
+     * Silently load EVERY paged-history page while the viewport stays put.
+     *
+     * The upper triple-click should end as ONE clean glide to the very top, but
+     * a smooth scroll cannot span a target that keeps growing: every landed page
+     * inserts rows above the port and pushes the top further away, and the
+     * browser's own animation stalls on each insertion. So instead of gliding
+     * while we load, we hold the viewport STILL — pinned to the offset it had
+     * when the gesture started (scrollHeight changes as pages land above, so
+     * anchoring to scrollHeight - clientHeight keeps the same rows under the
+     * reader's eye) — and only glide once the history is exhausted.
+     *
+     * The host's paging anchor is re-released every tick (same synthetic
+     * pointerdown the park uses), otherwise its post-commit layout pass would
+     * pin the port back to the "load earlier" row between pages.
+     *
+     * Returns true when it ran (caller is on its own to finish the gesture);
+     * false when there was nothing to preload (no scrollport / no control).
+     */
+    function preloadAllHistory(scope, port, onDone) {
+      if (!port || !scope) { onDone(); return false; }
+      const max = Math.max(0, port.scrollHeight - port.clientHeight);
+      if (max <= 0 || !findLoadEarlierButton(scope, port, false)) { onDone(); return false; }
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        try { port.removeEventListener('scroll', onScroll, true); } catch (e) {}
+        try { cancelAnimationFrame(raf); } catch (e) {}
+        try { onDone(); } catch (e) {}
+      };
+      // Keep the same rows under the reader's eye no matter how much lands above.
+      const freeze = () => {
+        try { port.scrollTop = Math.max(0, port.scrollHeight - port.clientHeight - max); } catch (e) {}
+      };
+      // A late host re-park lands as a scroll we did not write; re-assert.
+      const onScroll = () => { if (!finished) freeze(); };
+      let raf = 0;
+      // The host re-parks on its post-commit layout pass right after a page
+      // lands, so releasing the anchor once per landed page is enough — there is
+      // no need to hammer it every frame. Releasing is not free: each synthetic
+      // pointerdown drives the host's own stopPreserving machinery, so the
+      // freeze loop only writes the anchor offset and fires the release when the
+      // content height actually changes (a page landed above us).
+      let lastHeight = -1;
+      const tick = () => {
+        if (finished) return;
+        try {
+          const height = port.scrollHeight;
+          if (height !== lastHeight) {
+            lastHeight = height;
+            releaseHostAnchor(port);
+          }
+        } catch (e) {}
+        freeze();
+        try { raf = requestAnimationFrame(tick); } catch (e) {}
+      };
+      try { port.addEventListener('scroll', onScroll, true); } catch (e) {}
+      tick();
+      const step = (attempt) => {
+        if (finished) return;
+        try {
+          if (attempt >= MAX_ALL_LOAD) { finish(); return; }
+          const present = findLoadEarlierButton(scope, port, false);
+          if (!present) { finish(); return; } // history exhausted
+          // A superseded walk-up may have left the control disabled mid-load;
+          // wait for that page to land, then carry on from the same attempt.
+          if (present.disabled) {
+            const started = Date.now();
+            const wait = () => {
+              if (finished) return;
+              try {
+                if (Date.now() - started > PAGE_TIMEOUT) { finish(); return; }
+                const now = findLoadEarlierButton(scope, port, false);
+                if (!now) { finish(); return; }
+                if (!now.disabled) { step(attempt); return; }
+              } catch (e) {}
+              setTimeout(wait, 100);
+            };
+            setTimeout(wait, 100);
+            return;
+          }
+          const label = (present.textContent || '').trim();
+          present.click();
+          const started = Date.now();
+          const poll = () => {
+            if (finished) return;
+            try {
+              if (Date.now() - started > PAGE_TIMEOUT) { finish(); return; }
+              const now = findLoadEarlierButton(scope, port, false);
+              if (!now) { finish(); return; } // history exhausted
+              const nowLabel = (now.textContent || '').trim();
+              if (nowLabel === label && !now.disabled) { step(attempt + 1); return; } // page landed
+            } catch (e) {}
+            setTimeout(poll, 100);
+          };
+          // Let React commit the disabled/loading state before the first check.
+          setTimeout(poll, 200);
+        } catch (e) { finish(); }
+      };
+      step(0);
+      return true;
+    }
+
     function jumpToFront(container) {
       try {
         if (!container) return;
@@ -465,95 +569,19 @@ window.__ModuleLoader__.load({
         const port = (viewport && viewport.scrollHeight > viewport.clientHeight + 1) ? viewport : container;
         const scope = conversationScope(container);
 
-        // Park the scrollport at the very top for the WHOLE gesture. We start the
-        // park the instant the aggressive jump begins — NOT after history is
-        // exhausted — so loading the older pages and the final glide are ONE
-        // continuous upward motion, the same way the lower half's double-click is
-        // one continuous glide to the bottom. Starting early also means the host's
-        // paging-anchor re-park (which would otherwise snap the port to the "load
-        // earlier" row between loads) is re-released on every park tick, so there
-        // is no separate "jump to the load-earlier position" step before the
-        // animation.
-        //
-        // The host keeps a paging anchor while history is loading and re-parks the
-        // scrollport on it during its post-commit layout pass. It ONLY drops that
-        // anchor on a "reading intent" (a pointerdown/wheel/keydown), so parkAtTop
-        // dispatches a synthetic pointerdown to release it, then glides to 0 and
-        // holds. A real user gesture still cancels the park immediately.
-        let parkStarted = false;
-        const done = () => {
-          frontJumpInFlight = false;
-          walkAbort = false;
-          // History exhausted. The continuous park that began with this gesture is
-          // still holding (and still needed, to defend against any late re-park),
-          // so we do NOT start a second one — just clear the suppression flags. If
-          // for some reason the park never started (e.g. no control was found),
-          // start it now so the top is still pinned.
-          if (!parkStarted) parkAtTop(port);
-        };
-
-        const startPark = () => {
-          if (parkStarted) return;
-          parkStarted = true;
-          parkAtTop(port);
-        };
-
-        const step = (attempt) => {
-          try {
-            if (attempt >= MAX_ALL_LOAD) { done(); return; }
-            // The control only exists while older history is still paged above.
-            const present = findLoadEarlierButton(scope, port, false);
-            if (!present) { done(); return; } // history exhausted: park now
-            // A superseded walk-up (the upper-area double-click that fired just
-            // before this aggressive jump) may already be loading a page, so the
-            // control is present but disabled. Do NOT bail to the park here: that
-            // would leave the scrollport parked at the half-loaded position ("only
-            // reached the previous conversation"). Wait for the in-flight load to
-            // land, then continue from the same attempt (we have not clicked a new
-            // page yet) and load every remaining page to the very top.
-            if (present.disabled) {
-              const started = Date.now();
-              const wait = () => {
-                try {
-                  if (Date.now() - started > PAGE_TIMEOUT) { done(); return; }
-                  const now = findLoadEarlierButton(scope, port, false);
-                  if (!now) { done(); return; } // landed and exhausted meanwhile
-                  if (!now.disabled) { step(attempt); return; } // ready: click it
-                } catch (e) {}
-                setTimeout(wait, 100);
-              };
-              setTimeout(wait, 100);
-              return;
-            }
-            const label = (present.textContent || '').trim();
-            present.click();
-            let settled = false;
-            const finish = () => {
-              if (settled) return;
-              settled = true;
-              try { step(attempt + 1); } catch (e) {}
-            };
-            const started = Date.now();
-            const poll = () => {
-              try {
-                if (Date.now() - started > PAGE_TIMEOUT) { finish(); return; }
-                const now = findLoadEarlierButton(scope, port, false);
-                if (!now) { finish(); return; } // history exhausted
-                const nowLabel = (now.textContent || '').trim();
-                if (nowLabel === label && !now.disabled) { finish(); return; } // page landed
-              } catch (e) {}
-              setTimeout(poll, 100);
-            };
-            // Let React commit the disabled/loading state before the first check.
-            setTimeout(poll, 200);
-          } catch (e) {
-            done();
-          }
-        };
+        // Load every older page FIRST, with the viewport held still, then make
+        // ONE clean glide to the very top. Gliding while the history is still
+        // loading cannot work: the destination keeps moving away as pages land
+        // above, and the browser stalls its own animation on every insertion.
+        // The final glide is a park (parkAtTop), so once we do reach the top the
+        // existing watchdog still defends it against a late host re-park.
         frontJumpInFlight = true;
         walkAbort = true;
-        startPark();
-        step(0);
+        preloadAllHistory(scope, port, () => {
+          frontJumpInFlight = false;
+          walkAbort = false;
+          parkAtTop(port);
+        });
       } catch (e) {
         try { frontJumpInFlight = false; walkAbort = false; } catch (e2) {}
       }
