@@ -104,27 +104,34 @@ window.__ModuleLoader__.load({
     // and stops itself, so an older park cannot fight a newer gesture.
     let parkId = 0;
 
-    // Beyond this many viewport heights a gesture stops animating and writes the
-    // offset directly. A native smooth glide emits roughly one scroll event per
-    // animation frame for a second and a half, and on the host every one of those
-    // is answered with layout work: onScroll -> readScroll/invalidate, then at
-    // scrollend acknowledge -> reclaimBelow (a spacer height write) ->
-    // refreshActiveTurn -> readVisibleTurn's O(all rows) probe over a transcript
-    // that is NOT virtualized (the chat bundle's only useVirtualizer is the turn
-    // rail; every loaded message stays mounted). Measured on a b04b03-shaped DOM
-    // of 270k elements, one smooth "scroll to bottom" fired 67 scroll events and
-    // 2 scrollends where the same destination reached by an instant write fired 1
-    // and 0. Chromium already refuses to animate very long distances, so the
-    // glide is a cost with no payoff past a few screens.
+    // A native smooth glide emits roughly one scroll event per animation frame
+    // for a second and a half, and on the host every one of those is answered
+    // with layout work: onScroll -> readScroll/invalidate, then at scrollend
+    // acknowledge -> reclaimBelow (a spacer height write) -> refreshActiveTurn
+    // -> readVisibleTurn's O(all rows) probe over a transcript that is NOT
+    // virtualized (the chat bundle's only useVirtualizer is the turn rail; every
+    // loaded message stays mounted). Measured on a b04b03-shaped DOM of 270k
+    // elements, one smooth "scroll to bottom" fired 67 scroll events and 2
+    // scrollends where the same destination reached by an instant write fired 1
+    // and 0. The headline gestures keep their slide anyway (see below); the gate
+    // exists so the park's repeated re-assert ticks and the upper walk-up cannot
+    // multiply that cost.
+    // The two headline gestures — lower double-click to the bottom and the
+    // upper triple-click to the very front — keep their slide no matter how far
+    // they travel; snapping them reads as the feature being broken. Everything
+    // else (the park's re-assert ticks, the upper walk-up past a huge turn)
+    // stays on the distance gate below.
     const SMOOTH_MAX_VP = 6;
 
-    // Request a smooth glide when the distance is short enough to stay cheap,
-    // otherwise write the offset directly. Returns true only when a smooth
-    // request was actually issued, so callers keep their scrollend bookkeeping
-    // tied to a real animation. No clamping here: the browser clamps both forms.
-    function glideOrSnap(port, top) {
+    // Request a smooth glide, or — for the distance-gated callers — write the
+    // offset directly once the jump is more than a few screens. Returns true
+    // only when a smooth request was actually issued, so callers keep their
+    // scrollend bookkeeping tied to a real animation. No clamping here: the
+    // browser clamps both forms.
+    function glideOrSnap(port, top, opts) {
+      const force = !!(opts && opts.forceGlide);
       const viewport = port.clientHeight || 0;
-      if (viewport && Math.abs(top - port.scrollTop) > SMOOTH_MAX_VP * viewport) {
+      if (!force && viewport && Math.abs(top - port.scrollTop) > SMOOTH_MAX_VP * viewport) {
         port.scrollTop = top;
         return false;
       }
@@ -136,7 +143,7 @@ window.__ModuleLoader__.load({
       try {
         if (!container) return;
         if (typeof container.scrollTo === 'function') {
-          glideOrSnap(container, container.scrollHeight);
+          glideOrSnap(container, container.scrollHeight, { forceGlide: true });
         } else {
           container.scrollTop = container.scrollHeight;
         }
@@ -633,11 +640,12 @@ window.__ModuleLoader__.load({
         releaseHostAnchor(port);
         const max = Math.max(0, port.scrollHeight - port.clientHeight);
         const top = Math.min(target, max);
-        // Same primitive the lower-half scroll uses: a glide when the distance is
-        // short, a direct write when it is long. Parking from the bottom of a long
-        // transcript is exactly the long case, and gliding there would fire ~100
-        // scroll events, each answered by host layout work.
-        try { glideOrSnap(port, top); }
+        // The triple-click to the very front is one continuous upward slide, the
+        // same way the lower half's double-click is one continuous slide to the
+        // bottom — so the park's FIRST move always glides, even from the bottom
+        // of a long transcript. Only the re-assert ticks below fall back to the
+        // distance gate, so defending the top never multiplies host work.
+        try { glideOrSnap(port, top, { forceGlide: true }); }
         catch (e) { try { port.scrollTop = top; } catch (e2) {} }
 
         let cancelled = false;

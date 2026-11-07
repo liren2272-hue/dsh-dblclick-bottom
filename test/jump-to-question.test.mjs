@@ -316,15 +316,17 @@ const SCENARIOS = [
     expectSmooth: false,
     waitMs: 900,
   },
-  // ---- long-distance writes: glide only over short spans (v1.4.3) ----
-  // A smooth scroll over many screens fires ~100 scroll events, and each one
-  // drives the host's own scroll machinery over a transcript that is not
-  // virtualized. Past a few viewports the plugin must write the offset directly.
+  // ---- the headline gestures always glide; the rest stays distance-gated ----
+  // The lower double-click and the upper triple-click keep their slide no matter
+  // how far they travel. The upper walk-up past a huge turn and the park's
+  // re-assert ticks still write the offset directly: a smooth scroll over many
+  // screens fires ~100 scroll events and each drives the host's own scroll
+  // machinery over a transcript that is not virtualized.
   {
-    name: 'snap: lower double-click over a long transcript writes the bottom directly',
+    name: 'glide: lower double-click over a long transcript still slides to the bottom',
     opts: { scrollTop: 0, scrollHeight: 200000, clientY: 700, rows: [makeRow(0, 100)] },
     expected: 200000,
-    expectSmooth: false,
+    expectSmooth: true,
   },
   {
     name: 'snap: upper double-click across a huge turn writes the offset directly',

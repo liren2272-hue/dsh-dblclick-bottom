@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-dblclick-bottom",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "icon": "./icon.svg",
   "private": true,
   "type": "module",
