@@ -456,22 +456,25 @@ window.__ModuleLoader__.load({
      * a smooth scroll cannot span a target that keeps growing: every landed page
      * inserts rows above the port and pushes the top further away, and the
      * browser's own animation stalls on each insertion. So instead of gliding
-     * while we load, we hold the viewport STILL — pinned to the offset it had
-     * when the gesture started (scrollHeight changes as pages land above, so
-     * anchoring to scrollHeight - clientHeight keeps the same rows under the
-     * reader's eye) — and only glide once the history is exhausted.
+     * while we load, we hold the viewport STILL at wherever the reader is right
+     * now and only glide once the history is exhausted. Crucially the hold is
+     * INCREMENTAL: we do NOT jump anywhere before loading starts (an earlier
+     * version anchored the port to the bottom of the already-loaded content,
+     * which read as "jump up to the load-earlier area, wait, then slide"). We
+     * just remember the reader's scrollTop and, each time a page lands above,
+     * add however much the content grew by — so the same rows stay under the
+     * reader's eye and nothing visibly moves until the final glide.
      *
-     * The host's paging anchor is re-released every tick (same synthetic
-     * pointerdown the park uses), otherwise its post-commit layout pass would
-     * pin the port back to the "load earlier" row between pages.
+     * The host's paging anchor is re-released only when a page actually lands
+     * (scrollHeight changes) — that is the only moment it would pin the port to
+     * the "load earlier" row, so there is no need to touch it every frame.
      *
      * Returns true when it ran (caller is on its own to finish the gesture);
      * false when there was nothing to preload (no scrollport / no control).
      */
     function preloadAllHistory(scope, port, onDone) {
       if (!port || !scope) { onDone(); return false; }
-      const max = Math.max(0, port.scrollHeight - port.clientHeight);
-      if (max <= 0 || !findLoadEarlierButton(scope, port, false)) { onDone(); return false; }
+      if (Math.max(0, port.scrollHeight - port.clientHeight) <= 0 || !findLoadEarlierButton(scope, port, false)) { onDone(); return false; }
       let finished = false;
       const finish = () => {
         if (finished) return;
@@ -480,9 +483,22 @@ window.__ModuleLoader__.load({
         try { cancelAnimationFrame(raf); } catch (e) {}
         try { onDone(); } catch (e) {}
       };
-      // Keep the same rows under the reader's eye no matter how much lands above.
+      // Anchor to the reader's CURRENT position, not to a precomputed target.
+      // As pages land above, scrollHeight grows by the inserted height; adding
+      // that same amount to scrollTop keeps the identical rows in view without
+      // ever jumping. The first tick is a no-op (delta 0), so the gesture starts
+      // with the viewport exactly where the user left it.
+      let lastHeight = port.scrollHeight;
+      let lastTop = port.scrollTop;
       const freeze = () => {
-        try { port.scrollTop = Math.max(0, port.scrollHeight - port.clientHeight - max); } catch (e) {}
+        try {
+          const height = port.scrollHeight;
+          if (height !== lastHeight) {
+            lastTop += (height - lastHeight);
+            lastHeight = height;
+          }
+          if (port.scrollTop !== lastTop) port.scrollTop = lastTop;
+        } catch (e) {}
       };
       // A late host re-park lands as a scroll we did not write; re-assert.
       const onScroll = () => { if (!finished) freeze(); };
@@ -490,18 +506,12 @@ window.__ModuleLoader__.load({
       // The host re-parks on its post-commit layout pass right after a page
       // lands, so releasing the anchor once per landed page is enough — there is
       // no need to hammer it every frame. Releasing is not free: each synthetic
-      // pointerdown drives the host's own stopPreserving machinery, so the
-      // freeze loop only writes the anchor offset and fires the release when the
-      // content height actually changes (a page landed above us).
-      let lastHeight = -1;
+      // pointerdown drives the host's own stopPreserving machinery, so we only
+      // fire it when the content height actually changes (a page landed above).
       const tick = () => {
         if (finished) return;
         try {
-          const height = port.scrollHeight;
-          if (height !== lastHeight) {
-            lastHeight = height;
-            releaseHostAnchor(port);
-          }
+          if (port.scrollHeight !== lastHeight) releaseHostAnchor(port);
         } catch (e) {}
         freeze();
         try { raf = requestAnimationFrame(tick); } catch (e) {}
