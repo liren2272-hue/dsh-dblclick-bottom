@@ -3,6 +3,12 @@ window.__ModuleLoader__.load({
   factory(require) {
     'use strict';
 
+    // Build stamp: lets us confirm which client.js the running DSH actually
+    // loaded (read window.__DBLCLICK_BOTTOM_BUILD__). After the 0.2.2-rc.2 fix
+    // the glideOrSnap path is an instant scrollTop write (no native smooth), so
+    // the host's ScrollFollow no longer snap-backs the jump.
+    window.__DBLCLICK_BOTTOM_BUILD__ = '2026-11-12-paged-landing-v3';
+
     const CONVERSATION_SELECTOR = '[data-conversation-scroll]';
     const SIDE_COLUMN_SELECTOR = '[data-sidebar-right-panel]';
     const BOTTOM_THRESHOLD = 0.72;
@@ -88,6 +94,18 @@ window.__ModuleLoader__.load({
     // history cannot loop forever if the host never removes its control.
     const MAX_ALL_LOAD = 60;
     const PAGE_TIMEOUT = 15000;
+    // Per-page landing detection (see watchPageLanding). On DSH 0.2.2-rc.2 the
+    // host renders the load-earlier button's 5 state labels as STACKED <span>s
+    // toggled by visibility/aria-hidden, so button.textContent is a CONSTANT
+    // concatenation and `disabled` only tracks `!hasMore` -- neither changes
+    // while a page loads. The old "label restored && !disabled" check was true
+    // on the first poll, firing every page click in a burst; the host swallowed
+    // all but the first and parkAtTop(0) ran against a still-paging transcript.
+    // The only reliable signal is CONTENT GROWTH: each landed page prepends rows
+    // above the viewport, increasing port.scrollHeight.
+    const PAGE_GROW_MIN = 24;   // a prepended page always adds at least this many px
+    const PAGE_SETTLE_MS = 350; // height must stay still this long = page committed
+    const NO_GROW_MS = 2500;    // no growth at all: click swallowed / empty page, give up
 
     // Set while the aggressive "jump to the very front" gesture is loading
     // history; suppresses the ordinary upper-area double-click walk so the two
@@ -123,20 +141,26 @@ window.__ModuleLoader__.load({
     // stays on the distance gate below.
     const SMOOTH_MAX_VP = 6;
 
-    // Request a smooth glide, or — for the distance-gated callers — write the
-    // offset directly once the jump is more than a few screens. Returns true
-    // only when a smooth request was actually issued, so callers keep their
-    // scrollend bookkeeping tied to a real animation. No clamping here: the
-    // browser clamps both forms.
+    // Write the offset directly (never a native smooth). DSH 0.2.2+ owns the
+    // scrollport through ChatViewport/ScrollFollow and snap-backs any native
+    // smooth scroll, classifying its continuous frames as reader movement and
+    // dragging the offset back to the host's acknowledged position — which is
+    // exactly the "double-click lower does not reach the bottom" regression.
+    // A direct scrollTop write is accepted instead: the host re-acknowledges it
+    // and, once it lands near the floor or ceiling, keeps following the tail or
+    // the front. writeScroll re-asserts the target a few times to survive a
+    // pending fold or layout shift, then stops if the reader moves it. Returns
+    // false so callers treat every jump as a finished direct write and skip
+    // their scrollend bookkeeping. No clamping here: the browser clamps.
     function glideOrSnap(port, top, opts) {
       const force = !!(opts && opts.forceGlide);
       const viewport = port.clientHeight || 0;
       if (!force && viewport && Math.abs(top - port.scrollTop) > SMOOTH_MAX_VP * viewport) {
-        port.scrollTop = top;
+        writeScroll(port, top);
         return false;
       }
-      port.scrollTo({ top, behavior: 'smooth' });
-      return true;
+      writeScroll(port, top);
+      return false;
     }
 
     function scrollToBottom(container) {
@@ -199,24 +223,69 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Wait for ONE paged-history page to actually land after a programmatic
+     * click on the host's "load earlier" control.
+     *
+     * DSH 0.2.2-rc.2 renders that control's five state labels ("加载更早" /
+     * "正在加载" / "正在处理" / "重新加载" / "已到会话开头") as STACKED
+     * <span>s sharing one grid cell, toggled only by visibility/aria-hidden.
+     * So button.textContent is a CONSTANT concatenation of all five, and
+     * disabled is bound ONLY to !hasMore -- neither changes while a page is
+     * loading. The old "label back to its original && !disabled" landing check
+     * was therefore true on the very first poll, which fired all MAX_ALL_LOAD
+     * clicks in a burst; the host's if (loadingOlder) return swallowed all but
+     * the first, so only 1-2 pages ever really loaded before parkAtTop(0) ran
+     * against a still-paging transcript and the host's preserve() re-park
+     * dragged the port back -- the "upper triple-click does not reach the top"
+     * regression on paged conversations.
+     *
+     * The only reliable landing signal is CONTENT GROWTH: each landed page
+     * prepends rows above the viewport, increasing port.scrollHeight. We wait
+     * for that growth AND a short stability window (so the page is fully
+     * committed and the host's post-commit preserve() has fired) before the
+     * caller clicks again. Control removed / disabled / timeout / no growth
+     * all end the wait as a graceful "stop here".
+     */
+    function watchPageLanding(scope, port, baseline, opts) {
+      const started = Date.now();
+      let lastHeight = baseline;
+      let lastChange = started;
+      let grew = false;
+      const poll = () => {
+        try {
+          if (Date.now() - started > opts.maxMs) { opts.onExhausted(); return; }
+          const now = findLoadEarlierButton(scope, port, false);
+          if (!now) { opts.onExhausted(); return; } // control removed: history exhausted
+          const height = port.scrollHeight;
+          if (height !== lastHeight) {
+            if (height > baseline + PAGE_GROW_MIN) grew = true;
+            lastHeight = height;
+            lastChange = Date.now();
+          }
+          if (now.disabled && grew) { opts.onExhausted(); return; } // reached the start
+          if (grew && Date.now() - lastChange >= PAGE_SETTLE_MS) { opts.onLanded(); return; }
+          if (!grew && Date.now() - started > NO_GROW_MS) { opts.onExhausted(); return; } // click swallowed
+        } catch (e) {}
+        setTimeout(poll, 100);
+      };
+      // Give React a frame to start the load before the first measurement.
+      setTimeout(poll, 200);
+    }
+
+    /**
      * Click the host's "load earlier" control and retry once the new page lands.
-     *
-     * When the transcript is paged, the host keeps the scrollport anchored while
-     * the older page loads (loadEarlier -> viewport.beginPaging()). The control
-     * is disabled and relabeled while loading, so polling for it to be restored
-     * (or removed, when history is exhausted) tells us the page has landed and
-     * the newly prepended rows are measurable. A programmatic click does not
-     * fire dblclick, so this cannot recurse into the double-click handler.
-     *
-     * Returns true when a load was started and the caller should return and
-     * retry later; false when there is nothing to load and it should proceed.
+     * A programmatic click does not fire dblclick, so this cannot recurse into
+     * the double-click handler. Returns true when a load was started (the
+     * caller returns and retries via then()); false when there is nothing to
+     * load. The page-landing wait is delegated to watchPageLanding so the same
+     * correct signal is used by the aggressive front jump.
      */
     function loadOlderHistory(scope, port, attempt, then) {
       try {
         if (attempt >= MAX_AUTO_LOAD) return false;
         const btn = findLoadEarlierButton(scope, port, true);
         if (!btn) return false;
-        const label = (btn.textContent || '').trim();
+        const baseline = port.scrollHeight;
         btn.click();
         let settled = false;
         const finish = () => {
@@ -224,19 +293,11 @@ window.__ModuleLoader__.load({
           settled = true;
           try { then(); } catch (e) {}
         };
-        const started = Date.now();
-        const poll = () => {
-          try {
-            if (Date.now() - started > 8000) { finish(); return; }
-            const now = findLoadEarlierButton(scope, port, false);
-            if (!now) { finish(); return; } // history exhausted
-            const nowLabel = (now.textContent || '').trim();
-            if (nowLabel === label && !now.disabled) { finish(); return; } // page landed
-          } catch (e) {}
-          setTimeout(poll, 100);
-        };
-        // Let React commit the disabled/loading state before the first check.
-        setTimeout(poll, 200);
+        watchPageLanding(scope, port, baseline, {
+          maxMs: 8000,
+          onLanded: finish,
+          onExhausted: finish,
+        });
         return true;
       } catch (e) { return false; }
     }
@@ -523,40 +584,20 @@ window.__ModuleLoader__.load({
         try {
           if (attempt >= MAX_ALL_LOAD) { finish(); return; }
           const present = findLoadEarlierButton(scope, port, false);
-          if (!present) { finish(); return; } // history exhausted
-          // A superseded walk-up may have left the control disabled mid-load;
-          // wait for that page to land, then carry on from the same attempt.
-          if (present.disabled) {
-            const started = Date.now();
-            const wait = () => {
-              if (finished) return;
-              try {
-                if (Date.now() - started > PAGE_TIMEOUT) { finish(); return; }
-                const now = findLoadEarlierButton(scope, port, false);
-                if (!now) { finish(); return; }
-                if (!now.disabled) { step(attempt); return; }
-              } catch (e) {}
-              setTimeout(wait, 100);
-            };
-            setTimeout(wait, 100);
-            return;
-          }
-          const label = (present.textContent || '').trim();
+          if (!present) { finish(); return; } // control removed: history exhausted
+          if (present.disabled) { finish(); return; } // hasMore=false: reached the start
+          const baseline = port.scrollHeight;
           present.click();
-          const started = Date.now();
-          const poll = () => {
-            if (finished) return;
-            try {
-              if (Date.now() - started > PAGE_TIMEOUT) { finish(); return; }
-              const now = findLoadEarlierButton(scope, port, false);
-              if (!now) { finish(); return; } // history exhausted
-              const nowLabel = (now.textContent || '').trim();
-              if (nowLabel === label && !now.disabled) { step(attempt + 1); return; } // page landed
-            } catch (e) {}
-            setTimeout(poll, 100);
-          };
-          // Let React commit the disabled/loading state before the first check.
-          setTimeout(poll, 200);
+          // Wait for THIS page to really land (content growth + a stable
+          // commit) before asking for the next one. A programmatic click does
+          // not fire dblclick, so this cannot recurse into the double-click
+          // handler. Never advance on a label/disabled comparison again: the
+          // 0.2.2-rc.2 host keeps both constant during a load.
+          watchPageLanding(scope, port, baseline, {
+            maxMs: PAGE_TIMEOUT,
+            onLanded: () => step(attempt + 1),
+            onExhausted: () => finish(),
+          });
         } catch (e) { finish(); }
       };
       step(0);
